@@ -31,6 +31,6 @@ modules:
     sources:
       - ./nuget-sources.json
     build-commands:
-      - dotnet publish <project-name>.csproj -c Release --no-self-contained --source ./nuget-sources
+      - dotnet publish BSDisplayControl.csproj -c Release --no-self-contained --source ./nuget-sources
       - mkdir -p ${FLATPAK_DEST}/bin
       - cp -r bin/Release/net8.0/publish/* ${FLATPAK_DEST}/bin

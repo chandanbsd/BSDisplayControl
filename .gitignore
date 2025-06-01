@@ -1,4 +1,5 @@
 **bin/
 **obj/
 
-**.flatpack-builder/
+**.flatpak-builder/
+**build-dir/

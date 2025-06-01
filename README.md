@@ -20,7 +20,7 @@
 
 - Build and install using Flatpak builder
 
-`flatpak-builder build-dir --user --force-clean --install --repo=repo com.chandanbsd.bsdisplaycontrol.yaml`
+`flatpak-builder build-dir --user --force-clean --install --repo=repo com.chandanbsd.bsdisplaycontrol.yml`
 
 - Run the install Flatpak application
 

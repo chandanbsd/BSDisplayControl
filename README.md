@@ -16,7 +16,7 @@
 
 - Generate `nuget-sources.json`
 
-`python3 flatpak-dotnet-generator.py --dotnet 9 --freedesktop 23.08 nuget-sources.json ../src/BSDisplayControl.csproj`
+`python3.12 flatpak-dotnet-generator.py --dotnet 9 --freedesktop 23.08 nuget-sources.json ../src/BSDisplayControl.csproj`
 
 - Build and install using Flatpak builder
 

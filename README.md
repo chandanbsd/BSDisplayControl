@@ -1,27 +1,16 @@
-# BSDisplayControl
+# bs_display_control
 
-## Flatpak build instructions
+Cross-platform display brightness control
 
-- Install flatpak
+## Getting Started
 
-  `sudo yum install flatpak`
+This project is a starting point for a Flutter application.
 
-- Change director to flatpack
+A few resources to get you started if this is your first Flutter project:
 
-- Use the `com.chandanbsd.bsdisplaycontrol.yml`
+- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
+- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
 
-- Install dependencies from Flathub
-
-`flatpak-builder build-dir --user --install-deps-from=flathub --download-only com.chandanbsd.bsdisplaycontrol.yml`
-
-- Generate `nuget-sources.json`
-
-`python3.12 flatpak-dotnet-generator.py --dotnet 9 --freedesktop 24.08 nuget-sources.json ../src/BSDisplayControl.csproj`
-
-- Build and install using Flatpak builder
-
-`flatpak-builder build-dir --user --force-clean --install --repo=repo com.chandanbsd.bsdisplaycontrol.yml`
-
-- Run the install Flatpak application
-
-`flatpak run com.chandanbsd.bsdisplaycontrol`
+For help getting started with Flutter development, view the
+[online documentation](https://docs.flutter.dev/), which offers tutorials,
+samples, guidance on mobile development, and a full API reference.

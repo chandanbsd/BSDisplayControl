@@ -1,6 +1,36 @@
-**bin/
-**obj/
+# General
+*.log
+*.tmp
+*.swp
+.DS_Store
 
-flatpak/.flatpak-builder/
-flatpak/build-dir/
-flatpak/repo
+# Flutter / Dart / Packages
+.dart_tool/
+.packages
+.pub/
+/build/
+coverage/
+.pub-cache/
+
+# Flutter generated files
+**/generated_plugin_registrant.*
+**/GeneratedPluginRegistrant.swift
+
+# IDEs / Editors
+.idea/
+.vscode/
+*.iml
+
+# OS-specific
+Thumbs.db
+
+# Android / iOS / macOS build artifacts
+android/.gradle/
+android/local.properties
+ios/Flutter/ephemeral/
+ios/Flutter/Generated.xcconfig
+ios/Flutter/flutter_export_environment.sh
+macos/Flutter/ephemeral/
+
+# Misc
+.env

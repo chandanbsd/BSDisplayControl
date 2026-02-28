@@ -22,6 +22,17 @@ add_definitions(-DAPPLICATION_ID="${APPLICATION_ID}")
 # Add dependency libraries. Add any application-specific dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter)
 target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::GTK)
-target_link_libraries(${BINARY_NAME} PRIVATE stdc++fs)
+
+# On modern GCC (9+), std::filesystem is part of libstdc++ and does not need
+# a separate -lstdc++fs.  When building with clang on Ubuntu the GCC dev
+# library path may not be on the default search path, so add it explicitly.
+if(EXISTS "/usr/lib/gcc/x86_64-linux-gnu")
+  file(GLOB _gcc_libdirs "/usr/lib/gcc/x86_64-linux-gnu/*")
+  foreach(_dir ${_gcc_libdirs})
+    if(IS_DIRECTORY ${_dir})
+      target_link_directories(${BINARY_NAME} PRIVATE ${_dir})
+    endif()
+  endforeach()
+endif()
 
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")

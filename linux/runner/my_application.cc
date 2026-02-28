@@ -14,21 +14,89 @@
 #include <sstream>
 #include <filesystem>
 #include <algorithm>
+#include <map>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <linux/i2c-dev.h>
+#include <linux/i2c.h>
 
 #include "flutter/generated_plugin_registrant.h"
 
 // ── Display info structure ─────────────────────────────────────────
 
 struct DisplayInfo {
-  std::string id;
-  std::string name;
-  double brightness;
+  std::string id;          // Unique ID (e.g., "backlight", "drm:card1-DP-1")
+  std::string name;        // Human-readable name from EDID
+  double brightness;       // 0.0 – 1.0
   bool isBuiltIn;
+  int i2cBus;              // I2C bus number for DDC/CI, -1 if N/A
+  std::string drmConnector; // DRM connector name (e.g., "card1-DP-1")
+  std::string xrandrName;  // xrandr output name (e.g., "DP-1")
 };
+
+// ── Utility: run a command and capture stdout ──────────────────────
+
+static std::string RunCommand(const std::string& cmd) {
+  FILE* pipe = popen(cmd.c_str(), "r");
+  if (!pipe) return "";
+  std::string result;
+  char buf[256];
+  while (fgets(buf, sizeof(buf), pipe)) {
+    result += buf;
+  }
+  pclose(pipe);
+  return result;
+}
+
+// ── Utility: check if a command exists ─────────────────────────────
+
+static bool CommandExists(const std::string& cmd) {
+  std::string check = "which " + cmd + " >/dev/null 2>&1";
+  return system(check.c_str()) == 0;
+}
+
+// ── EDID parsing: extract monitor name from raw EDID ───────────────
+
+static std::string ParseEdidName(const std::string& edidPath) {
+  std::ifstream file(edidPath, std::ios::binary);
+  if (!file.is_open()) return "";
+
+  std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+  if (data.size() < 128) return "";
+
+  // Parse manufacturer ID from bytes 8-9 (compressed ASCII).
+  uint16_t mfr = (static_cast<uint16_t>(data[8]) << 8) | data[9];
+  char c1 = static_cast<char>(((mfr >> 10) & 0x1F) + 64);
+  char c2 = static_cast<char>(((mfr >> 5) & 0x1F) + 64);
+  char c3 = static_cast<char>((mfr & 0x1F) + 64);
+  std::string manufacturer = {c1, c2, c3};
+
+  // Parse descriptor blocks at offsets 54, 72, 90, 108 for monitor name (tag 0xFC).
+  std::string monitorName;
+  for (int off : {54, 72, 90, 108}) {
+    if (off + 18 > static_cast<int>(data.size())) break;
+    if (data[off] == 0 && data[off + 1] == 0 && data[off + 3] == 0xFC) {
+      for (int i = 5; i < 18; ++i) {
+        char ch = static_cast<char>(data[off + i]);
+        if (ch == '\n' || ch == '\0') break;
+        monitorName += ch;
+      }
+      break;
+    }
+  }
+
+  // Trim whitespace.
+  while (!monitorName.empty() && monitorName.back() == ' ')
+    monitorName.pop_back();
+
+  if (!monitorName.empty()) return monitorName;
+  return manufacturer;  // Fallback to manufacturer code.
+}
 
 // ── Brightness control via sysfs (backlight) ───────────────────────
 
@@ -36,14 +104,14 @@ static std::string FindBacklightPath() {
   const std::string basePath = "/sys/class/backlight";
   if (!std::filesystem::exists(basePath)) return "";
 
-  // Prefer intel_backlight, then acpi_video0, then any other.
-  std::vector<std::string> preferred = {"intel_backlight", "amdgpu_bl0", "amdgpu_bl1", "acpi_video0"};
+  std::vector<std::string> preferred = {
+    "intel_backlight", "amdgpu_bl0", "amdgpu_bl1", "acpi_video0"
+  };
   for (const auto& name : preferred) {
     auto path = basePath + "/" + name;
     if (std::filesystem::exists(path)) return path;
   }
 
-  // Fall back to first available.
   for (const auto& entry : std::filesystem::directory_iterator(basePath)) {
     return entry.path().string();
   }
@@ -71,7 +139,6 @@ static bool SetBacklightBrightness(const std::string& backlightPath, double brig
   if (maximum <= 0) return false;
 
   int newValue = static_cast<int>(std::clamp(brightness, 0.0, 1.0) * maximum);
-  // Ensure at least 1 to avoid turning off completely.
   if (newValue < 1 && brightness > 0.0) newValue = 1;
 
   std::ofstream curFile(backlightPath + "/brightness");
@@ -80,11 +147,10 @@ static bool SetBacklightBrightness(const std::string& backlightPath, double brig
     return curFile.good();
   }
 
-  // Fallback: use fork/exec with tee for permission issues (avoids system()).
+  // Fallback: use fork/exec with tee for permission issues.
   std::string brightnessFile = backlightPath + "/brightness";
   std::string valueStr = std::to_string(newValue);
 
-  // Create a pipe: write the value into it, then exec tee to write to the file.
   int pipefd[2];
   if (pipe(pipefd) != 0) return false;
 
@@ -96,23 +162,19 @@ static bool SetBacklightBrightness(const std::string& backlightPath, double brig
   }
 
   if (pid == 0) {
-    // Child: redirect stdin from pipe, redirect stdout to /dev/null.
     close(pipefd[1]);
     dup2(pipefd[0], STDIN_FILENO);
     close(pipefd[0]);
-
     int devnull = open("/dev/null", O_WRONLY);
     if (devnull >= 0) {
       dup2(devnull, STDOUT_FILENO);
       dup2(devnull, STDERR_FILENO);
       close(devnull);
     }
-
     execlp("tee", "tee", brightnessFile.c_str(), nullptr);
     _exit(1);
   }
 
-  // Parent: write value into pipe, then wait for child.
   close(pipefd[0]);
   write(pipefd[1], valueStr.c_str(), valueStr.size());
   close(pipefd[1]);
@@ -122,98 +184,486 @@ static bool SetBacklightBrightness(const std::string& backlightPath, double brig
   return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-// ── Brightness control via xrandr (external monitors) ──────────────
+// ── DDC/CI via direct I2C ──────────────────────────────────────────
+//
+// DDC/CI uses I2C address 0x37.  VCP code 0x10 = Brightness.
+// Protocol: write [0x51, 0x84, 0x03, 0x01, 0x10, 0x00, checksum]
+//           to get current value; parse the response.
 
-struct XrandrOutput {
-  std::string name;
-  bool connected;
-  double brightness;
+static const uint8_t DDC_CI_ADDR = 0x37;
+static const uint8_t VCP_BRIGHTNESS = 0x10;
+
+// Compute DDC/CI checksum: XOR of (source_addr << 1) and all payload bytes.
+// ── I2C permission setup ───────────────────────────────────────────
+//
+// DDC/CI requires read/write access to /dev/i2c-* devices.  On most Linux
+// distros these are root-only by default.  This helper sets up the required
+// udev rule and user group so the app can access I2C without root.
+// It runs once and uses pkexec (PolicyKit) to get the needed privileges.
+
+static bool g_i2c_setup_attempted = false;
+static bool g_i2c_accessible = false;
+
+static bool SetupI2cPermissions() {
+  if (g_i2c_setup_attempted) return g_i2c_accessible;
+  g_i2c_setup_attempted = true;
+
+  // Check if i2c-dev module is loaded; load it if not.
+  if (!std::filesystem::exists("/dev/i2c-0")) {
+    system("modprobe i2c-dev 2>/dev/null");
+  }
+
+  // Check if we already have access to any I2C device.
+  for (const auto& entry : std::filesystem::directory_iterator("/dev")) {
+    std::string name = entry.path().filename().string();
+    if (name.find("i2c-") == 0) {
+      int fd = open(entry.path().c_str(), O_RDWR);
+      if (fd >= 0) {
+        close(fd);
+        g_i2c_accessible = true;
+        fprintf(stderr, "[BSDisplayControl] I2C devices already accessible.\n");
+        return true;
+      }
+      break;  // If one is inaccessible, they all are.
+    }
+  }
+
+  // I2C devices exist but are not accessible.
+  fprintf(stderr, "[BSDisplayControl] I2C devices not accessible, requesting permissions...\n");
+
+  std::string user = getenv("USER") ? getenv("USER") : "";
+
+  // Step 1: Immediately grant access with chmod 0666 (simple, reliable pkexec call).
+  int ret = system("pkexec chmod 0666 /dev/i2c-*");
+  if (ret != 0) {
+    fprintf(stderr, "[BSDisplayControl] pkexec chmod failed (ret=%d).\n", ret);
+    fprintf(stderr, "[BSDisplayControl] You can set up manually:\n");
+    fprintf(stderr, "  sudo chmod 0666 /dev/i2c-*\n");
+    fprintf(stderr, "  (For permanent fix: sudo usermod -aG i2c $USER and reboot)\n");
+    return false;
+  }
+
+  // Step 2: Set up persistent udev rule + i2c group in background (best-effort).
+  // This makes permissions survive reboots. Failures here are non-fatal.
+  if (!user.empty()) {
+    // Write a small script to /tmp and execute it via pkexec.
+    std::string scriptPath = "/tmp/bsdisplaycontrol_i2c_setup.sh";
+    {
+      std::ofstream script(scriptPath);
+      script << "#!/bin/sh\n"
+             << "grep -q '^i2c:' /etc/group || groupadd i2c\n"
+             << "usermod -aG i2c " << user << "\n"
+             << "echo 'KERNEL==\"i2c-[0-9]*\", GROUP=\"i2c\", MODE=\"0666\"' "
+             << "> /etc/udev/rules.d/99-i2c-permissions.rules\n"
+             << "udevadm control --reload-rules 2>/dev/null\n"
+             << "udevadm trigger --subsystem-match=i2c-dev 2>/dev/null\n";
+    }
+    chmod(scriptPath.c_str(), 0755);
+
+    // Run the persistent setup via pkexec (separate prompt, or may be cached).
+    std::string setupCmd = "pkexec " + scriptPath + " 2>/dev/null";
+    int setupRet = system(setupCmd.c_str());
+    if (setupRet != 0) {
+      fprintf(stderr, "[BSDisplayControl] Persistent udev setup failed (non-fatal).\n");
+      fprintf(stderr, "[BSDisplayControl] Permissions will reset on reboot.\n");
+    } else {
+      fprintf(stderr, "[BSDisplayControl] Persistent I2C permissions installed.\n");
+    }
+    unlink(scriptPath.c_str());
+  }
+
+  // Verify access.
+  for (const auto& entry : std::filesystem::directory_iterator("/dev")) {
+    std::string name = entry.path().filename().string();
+    if (name.find("i2c-") == 0) {
+      int fd = open(entry.path().c_str(), O_RDWR);
+      if (fd >= 0) {
+        close(fd);
+        g_i2c_accessible = true;
+        fprintf(stderr, "[BSDisplayControl] I2C permissions set up successfully.\n");
+        return true;
+      }
+      break;
+    }
+  }
+
+  fprintf(stderr, "[BSDisplayControl] I2C still not accessible after setup.\n");
+  return false;
+}
+
+// ── DDC/CI protocol ────────────────────────────────────────────────
+
+static uint8_t DdcChecksum(uint8_t srcAddr, const uint8_t* data, size_t len) {
+  uint8_t csum = srcAddr;
+  for (size_t i = 0; i < len; ++i) csum ^= data[i];
+  return csum;
+}
+
+// Try to get brightness via DDC/CI on a given I2C bus.
+// Returns true if successful, with brightness in [0..100].
+static bool DdcGetBrightness(int busNum, int& outCurrent, int& outMax) {
+  std::string devPath = "/dev/i2c-" + std::to_string(busNum);
+  int fd = open(devPath.c_str(), O_RDWR);
+  if (fd < 0) {
+    fprintf(stderr, "[DDC] bus %d: open failed (errno %d)\n", busNum, errno);
+    return false;
+  }
+
+  if (ioctl(fd, I2C_SLAVE, DDC_CI_ADDR) < 0) {
+    fprintf(stderr, "[DDC] bus %d: ioctl I2C_SLAVE failed (errno %d)\n", busNum, errno);
+    close(fd);
+    return false;
+  }
+
+  uint8_t request[] = {0x51, 0x82, 0x01, VCP_BRIGHTNESS, 0x00};
+  request[4] = DdcChecksum(0x6E, request, 4);
+
+  ssize_t wr = write(fd, request, sizeof(request));
+  if (wr != sizeof(request)) {
+    fprintf(stderr, "[DDC] bus %d: write failed (%zd, errno %d)\n", busNum, wr, errno);
+    close(fd);
+    return false;
+  }
+
+  // DDC/CI spec says to wait 40-50ms for the monitor to respond.
+  usleep(50000);
+
+  // Read response: up to 12 bytes.
+  uint8_t response[12] = {};
+  ssize_t bytesRead = read(fd, response, sizeof(response));
+  close(fd);
+
+  fprintf(stderr, "[DDC] bus %d: read %zd bytes:", busNum, bytesRead);
+  for (ssize_t i = 0; i < bytesRead; ++i)
+    fprintf(stderr, " %02x", response[i]);
+  fprintf(stderr, "\n");
+
+  if (bytesRead < 9) {
+    fprintf(stderr, "[DDC] bus %d: response too short\n", busNum);
+    return false;
+  }
+
+  // Find the VCP Feature Reply opcode (0x02) in the response.
+  // Response format after opcode: [result][vcp_code][type][max_hi][max_lo][cur_hi][cur_lo]
+  int offset = -1;
+  for (int i = 0; i < bytesRead - 8; ++i) {
+    if (response[i] == 0x02 && response[i + 2] == VCP_BRIGHTNESS) {
+      offset = i;
+      break;
+    }
+  }
+  if (offset < 0) {
+    fprintf(stderr, "[DDC] bus %d: no VCP reply found in response\n", busNum);
+    return false;
+  }
+
+  // Check result code (0 = no error).
+  if (response[offset + 1] != 0x00) {
+    fprintf(stderr, "[DDC] bus %d: VCP result error %d\n", busNum, response[offset + 1]);
+    return false;
+  }
+
+  // offset+3 = VCP type code (skip it)
+  outMax = (response[offset + 4] << 8) | response[offset + 5];
+  outCurrent = (response[offset + 6] << 8) | response[offset + 7];
+
+  fprintf(stderr, "[DDC] bus %d: brightness %d/%d\n", busNum, outCurrent, outMax);
+
+  if (outMax <= 0) return false;
+  return true;
+}
+
+// Set brightness via DDC/CI on a given I2C bus.
+static bool DdcSetBrightness(int busNum, int value) {
+  std::string devPath = "/dev/i2c-" + std::to_string(busNum);
+  int fd = open(devPath.c_str(), O_RDWR);
+  if (fd < 0) {
+    fprintf(stderr, "[DDC SET] bus %d: open failed (errno %d)\n", busNum, errno);
+    return false;
+  }
+
+  if (ioctl(fd, I2C_SLAVE, DDC_CI_ADDR) < 0) {
+    fprintf(stderr, "[DDC SET] bus %d: ioctl failed (errno %d)\n", busNum, errno);
+    close(fd);
+    return false;
+  }
+
+  uint8_t valueHi = static_cast<uint8_t>((value >> 8) & 0xFF);
+  uint8_t valueLo = static_cast<uint8_t>(value & 0xFF);
+  uint8_t cmd[] = {0x51, 0x84, 0x03, VCP_BRIGHTNESS, valueHi, valueLo, 0x00};
+  cmd[6] = DdcChecksum(0x6E, cmd, 6);
+
+  fprintf(stderr, "[DDC SET] bus %d: setting brightness to %d, cmd:", busNum, value);
+  for (size_t i = 0; i < sizeof(cmd); ++i)
+    fprintf(stderr, " %02x", cmd[i]);
+  fprintf(stderr, "\n");
+
+  ssize_t written = write(fd, cmd, sizeof(cmd));
+  close(fd);
+
+  fprintf(stderr, "[DDC SET] bus %d: wrote %zd bytes (expected %zu)\n",
+          busNum, written, sizeof(cmd));
+  return written == static_cast<ssize_t>(sizeof(cmd));
+}
+
+// ── DDC/CI via ddcutil command-line (fallback) ─────────────────────
+
+static bool g_ddcutil_checked = false;
+static bool g_ddcutil_available = false;
+
+static bool IsDdcutilAvailable() {
+  if (!g_ddcutil_checked) {
+    g_ddcutil_available = CommandExists("ddcutil");
+    g_ddcutil_checked = true;
+  }
+  return g_ddcutil_available;
+}
+
+// Get brightness using ddcutil for a specific I2C bus.
+// Returns true if successful, with brightness 0-100.
+static bool DdcutilGetBrightness(int busNum, int& outCurrent, int& outMax) {
+  if (!IsDdcutilAvailable()) return false;
+
+  char cmd[128];
+  snprintf(cmd, sizeof(cmd),
+           "ddcutil getvcp 10 --bus %d --brief 2>/dev/null", busNum);
+  std::string output = RunCommand(cmd);
+
+  // Brief format: "VCP 10 C <current> <max>"
+  int current = 0, maximum = 0;
+  if (sscanf(output.c_str(), "VCP %*x C %d %d", &current, &maximum) == 2 && maximum > 0) {
+    outCurrent = current;
+    outMax = maximum;
+    return true;
+  }
+  return false;
+}
+
+static bool DdcutilSetBrightness(int busNum, int value) {
+  if (!IsDdcutilAvailable()) return false;
+
+  char cmd[128];
+  snprintf(cmd, sizeof(cmd),
+           "ddcutil setvcp 10 %d --bus %d --noverify 2>/dev/null", value, busNum);
+  return system(cmd) == 0;
+}
+
+// ── DRM-based display enumeration ──────────────────────────────────
+//
+// Enumerate connected displays by scanning /sys/class/drm/card*-*/.
+// For each connected connector:
+//   - Read EDID for human-readable name
+//   - Find the associated I2C bus (via i2c-* subdirectory or ddc symlink)
+//   - Map DRM connector name (e.g. "card1-DP-1") to xrandr name (e.g. "DP-1")
+
+struct DrmDisplay {
+  std::string connector;   // e.g., "card1-DP-1"
+  std::string xrandrName;  // e.g., "DP-1"
+  std::string edidName;    // e.g., "DELL U2412M"
+  int i2cBus;              // Primary I2C bus (from i2c-* subdir), -1 if N/A
+  int i2cBusDdc;           // Secondary I2C bus (from ddc symlink), -1 if N/A
+  bool isBuiltIn;
 };
 
-static std::vector<XrandrOutput> GetXrandrOutputs() {
-  std::vector<XrandrOutput> outputs;
+static std::string DrmConnectorToXrandr(const std::string& connector) {
+  // DRM connector: "card1-DP-1", "card1-HDMI-A-1"
+  // xrandr name:   "DP-1",       "HDMI-1"
+  auto dashPos = connector.find('-');
+  if (dashPos == std::string::npos) return connector;
+  std::string name = connector.substr(dashPos + 1);  // "DP-1" or "HDMI-A-1"
 
-  FILE* pipe = popen("xrandr --verbose 2>/dev/null", "r");
-  if (!pipe) return outputs;
+  // HDMI-A-1 -> HDMI-1 (xrandr drops the "-A")
+  auto hdmiA = name.find("HDMI-A-");
+  if (hdmiA != std::string::npos) {
+    name = "HDMI-" + name.substr(7);
+  }
+  return name;
+}
 
-  char line[1024];
-  XrandrOutput current;
-  bool inOutput = false;
+static std::vector<DrmDisplay> EnumerateDrmDisplays() {
+  std::vector<DrmDisplay> displays;
+  const std::string drmBase = "/sys/class/drm";
 
-  while (fgets(line, sizeof(line), pipe)) {
-    std::string l(line);
+  if (!std::filesystem::exists(drmBase)) return displays;
 
-    // Detect output lines like "HDMI-1 connected" or "eDP-1 connected".
-    if (l.find(" connected") != std::string::npos || l.find(" disconnected") != std::string::npos) {
-      if (inOutput && current.connected) {
-        outputs.push_back(current);
-      }
-      current = {};
-      // Extract output name (first word).
-      size_t spacePos = l.find(' ');
-      if (spacePos != std::string::npos) {
-        current.name = l.substr(0, spacePos);
-      }
-      current.connected = l.find(" connected") != std::string::npos;
-      current.brightness = 1.0;
-      inOutput = true;
-    }
-    // Look for Brightness property.
-    else if (inOutput && l.find("Brightness:") != std::string::npos) {
-      size_t colonPos = l.find(':');
-      if (colonPos != std::string::npos) {
-        std::string val = l.substr(colonPos + 1);
-        // Trim whitespace.
-        val.erase(0, val.find_first_not_of(" \t\n\r"));
-        val.erase(val.find_last_not_of(" \t\n\r") + 1);
+  for (const auto& entry : std::filesystem::directory_iterator(drmBase)) {
+    std::string dirname = entry.path().filename().string();
+    // Only look at connector entries like "card1-DP-1", not "card1" or "renderD128".
+    if (dirname.find("card") != 0) continue;
+    if (dirname.find('-') == std::string::npos) continue;
+    if (dirname.find("Writeback") != std::string::npos) continue;
+
+    std::string statusPath = entry.path().string() + "/status";
+    std::ifstream statusFile(statusPath);
+    if (!statusFile.is_open()) continue;
+    std::string status;
+    std::getline(statusFile, status);
+    if (status != "connected") continue;
+
+    DrmDisplay disp;
+    disp.connector = dirname;
+    disp.xrandrName = DrmConnectorToXrandr(dirname);
+    disp.i2cBus = -1;
+    disp.i2cBusDdc = -1;
+
+    // Check if this is a built-in display.
+    disp.isBuiltIn = (disp.xrandrName.find("eDP") == 0 ||
+                      disp.xrandrName.find("LVDS") == 0 ||
+                      disp.xrandrName.find("DSI") == 0);
+
+    // Read EDID for display name.
+    std::string edidPath = entry.path().string() + "/edid";
+    disp.edidName = ParseEdidName(edidPath);
+
+    // Find I2C bus: look for i2c-* subdirectory first, then ddc symlink.
+    for (const auto& sub : std::filesystem::directory_iterator(entry.path())) {
+      std::string subname = sub.path().filename().string();
+      if (subname.find("i2c-") == 0) {
         try {
-          current.brightness = std::stod(val);
-        } catch (...) {
-          current.brightness = 1.0;
+          disp.i2cBus = std::stoi(subname.substr(4));
+        } catch (...) {}
+        break;
+      }
+    }
+
+    if (disp.i2cBus < 0) {
+      // Check for "ddc" symlink (common for HDMI).
+      std::string ddcLink = entry.path().string() + "/ddc";
+      if (std::filesystem::is_symlink(ddcLink)) {
+        std::string target = std::filesystem::read_symlink(ddcLink).filename().string();
+        if (target.find("i2c-") == 0) {
+          try {
+            disp.i2cBus = std::stoi(target.substr(4));
+          } catch (...) {}
+        }
+      }
+    } else {
+      // We have an i2c-* subdir bus; also check for "ddc" symlink as fallback.
+      std::string ddcLink = entry.path().string() + "/ddc";
+      if (std::filesystem::is_symlink(ddcLink)) {
+        std::string target = std::filesystem::read_symlink(ddcLink).filename().string();
+        if (target.find("i2c-") == 0) {
+          try {
+            disp.i2cBusDdc = std::stoi(target.substr(4));
+          } catch (...) {}
         }
       }
     }
+
+    displays.push_back(disp);
+    fprintf(stderr, "[ENUM] %s (%s) i2c=%d ddc=%d edid='%s'\n",
+            disp.connector.c_str(), disp.xrandrName.c_str(),
+            disp.i2cBus, disp.i2cBusDdc, disp.edidName.c_str());
   }
 
-  // Don't forget the last output.
-  if (inOutput && current.connected) {
-    outputs.push_back(current);
-  }
-
-  pclose(pipe);
-  return outputs;
+  return displays;
 }
 
-static bool SetXrandrBrightness(const std::string& outputName, double brightness) {
-  double clamped = std::clamp(brightness, 0.0, 1.0);
-  // xrandr --output <name> --brightness <value>
-  // Note: xrandr brightness is a software gamma, not hardware DDC/CI.
+// ── Get brightness for a display (try DDC/CI, then ddcutil, then xrandr) ──
+// Try both I2C buses (primary from i2c-* subdir, fallback from ddc symlink).
 
+static double GetDisplayBrightness(const DrmDisplay& disp) {
+  // Collect candidate I2C buses to try.
+  std::vector<int> buses;
+  if (disp.i2cBus >= 0) buses.push_back(disp.i2cBus);
+  if (disp.i2cBusDdc >= 0 && disp.i2cBusDdc != disp.i2cBus)
+    buses.push_back(disp.i2cBusDdc);
+
+  fprintf(stderr, "[GET] %s: %zu candidate buses\n", disp.connector.c_str(), buses.size());
+
+  if (!buses.empty()) {
+    // Ensure I2C permissions are set up (one-time, prompts user if needed).
+    if (!g_i2c_accessible && !g_i2c_setup_attempted) {
+      SetupI2cPermissions();
+    }
+
+    for (int bus : buses) {
+      int current = 0, maximum = 100;
+      // Try direct I2C DDC/CI.
+      if (DdcGetBrightness(bus, current, maximum)) {
+        return static_cast<double>(current) / static_cast<double>(maximum);
+      }
+      // Try ddcutil as fallback.
+      if (DdcutilGetBrightness(bus, current, maximum)) {
+        return static_cast<double>(current) / static_cast<double>(maximum);
+      }
+    }
+  }
+
+  // Fallback: try xrandr verbose output for this specific output.
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), "xrandr --verbose 2>/dev/null | grep -A15 '^%s connected'",
+           disp.xrandrName.c_str());
+  std::string output = RunCommand(cmd);
+
+  auto bpos = output.find("Brightness:");
+  if (bpos != std::string::npos) {
+    auto cpos = output.find(':', bpos);
+    if (cpos != std::string::npos) {
+      std::string val = output.substr(cpos + 1);
+      val.erase(0, val.find_first_not_of(" \t"));
+      auto nlpos = val.find('\n');
+      if (nlpos != std::string::npos) val = val.substr(0, nlpos);
+      try {
+        return std::stod(val);
+      } catch (...) {}
+    }
+  }
+
+  return 1.0;  // Unknown.
+}
+
+// ── Set brightness for a display ───────────────────────────────────
+
+static bool SetDisplayBrightness(const DrmDisplay& disp, double brightness) {
+  int value = static_cast<int>(std::clamp(brightness, 0.0, 1.0) * 100);
+  fprintf(stderr, "[SET] %s: brightness=%.2f -> value=%d\n",
+          disp.connector.c_str(), brightness, value);
+
+  // Collect candidate I2C buses to try.
+  std::vector<int> buses;
+  if (disp.i2cBus >= 0) buses.push_back(disp.i2cBus);
+  if (disp.i2cBusDdc >= 0 && disp.i2cBusDdc != disp.i2cBus)
+    buses.push_back(disp.i2cBusDdc);
+
+  for (int bus : buses) {
+    // Try direct I2C DDC/CI first.
+    if (DdcSetBrightness(bus, value)) {
+      return true;
+    }
+    // Try ddcutil as fallback.
+    if (DdcutilSetBrightness(bus, value)) {
+      return true;
+    }
+  }
+
+  // Fallback: xrandr software brightness (gamma).
+  double clamped = std::clamp(brightness, 0.0, 1.0);
   char brightnessStr[32];
   snprintf(brightnessStr, sizeof(brightnessStr), "%.2f", clamped);
 
   pid_t pid = fork();
   if (pid < 0) return false;
-
   if (pid == 0) {
-    // Child: redirect stdout/stderr to /dev/null.
     int devnull = open("/dev/null", O_WRONLY);
     if (devnull >= 0) {
       dup2(devnull, STDOUT_FILENO);
       dup2(devnull, STDERR_FILENO);
       close(devnull);
     }
-
-    execlp("xrandr", "xrandr", "--output", outputName.c_str(),
+    execlp("xrandr", "xrandr", "--output", disp.xrandrName.c_str(),
            "--brightness", brightnessStr, nullptr);
     _exit(1);
   }
 
-  // Parent: wait for child.
   int status = 0;
   waitpid(pid, &status, 0);
   return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
+
+// ── Cached display list ────────────────────────────────────────────
+
+static std::vector<DrmDisplay> g_drmDisplays;
 
 // ── Method channel handler ─────────────────────────────────────────
 
@@ -225,13 +675,12 @@ static void brightness_method_call_handler(FlMethodChannel* channel,
   if (strcmp(method, "getDisplays") == 0) {
     g_autoptr(FlValue) list = fl_value_new_list();
 
-    // 1) Try sysfs backlight (built-in display).
+    // 1) Try sysfs backlight (built-in laptop display).
     std::string backlightPath = FindBacklightPath();
     if (!backlightPath.empty()) {
       g_autoptr(FlValue) display = fl_value_new_map();
       fl_value_set_string_take(display, "id", fl_value_new_string("backlight"));
 
-      // Extract the backlight driver name for display name.
       std::string driverName = std::filesystem::path(backlightPath).filename().string();
       std::string displayName = "Built-in Display (" + driverName + ")";
       fl_value_set_string_take(display, "name", fl_value_new_string(displayName.c_str()));
@@ -241,21 +690,23 @@ static void brightness_method_call_handler(FlMethodChannel* channel,
       fl_value_append_take(list, fl_value_ref(display));
     }
 
-    // 2) Enumerate xrandr outputs for external monitors.
-    auto xrandrOutputs = GetXrandrOutputs();
-    for (const auto& output : xrandrOutputs) {
-      // Skip eDP (embedded display) if we already have a backlight entry.
-      if (!backlightPath.empty() &&
-          (output.name.find("eDP") == 0 || output.name.find("LVDS") == 0)) {
-        continue;
-      }
+    // 2) Enumerate external monitors via DRM sysfs.
+    g_drmDisplays = EnumerateDrmDisplays();
+    for (const auto& disp : g_drmDisplays) {
+      // Skip built-in displays if we already have a backlight entry.
+      if (!backlightPath.empty() && disp.isBuiltIn) continue;
 
       g_autoptr(FlValue) display = fl_value_new_map();
-      fl_value_set_string_take(display, "id", fl_value_new_string(output.name.c_str()));
-      fl_value_set_string_take(display, "name", fl_value_new_string(output.name.c_str()));
-      fl_value_set_string_take(display, "brightness", fl_value_new_float(output.brightness));
-      bool isBuiltIn = output.name.find("eDP") == 0 || output.name.find("LVDS") == 0;
-      fl_value_set_string_take(display, "isBuiltIn", fl_value_new_bool(isBuiltIn));
+
+      std::string id = "drm:" + disp.connector;
+      fl_value_set_string_take(display, "id", fl_value_new_string(id.c_str()));
+
+      std::string name = disp.edidName.empty() ? disp.xrandrName : disp.edidName;
+      fl_value_set_string_take(display, "name", fl_value_new_string(name.c_str()));
+
+      double brightness = GetDisplayBrightness(disp);
+      fl_value_set_string_take(display, "brightness", fl_value_new_float(brightness));
+      fl_value_set_string_take(display, "isBuiltIn", fl_value_new_bool(disp.isBuiltIn));
       fl_value_append_take(list, fl_value_ref(display));
     }
 
@@ -279,6 +730,8 @@ static void brightness_method_call_handler(FlMethodChannel* channel,
     const char* displayId = fl_value_get_string(idVal);
     double brightness = fl_value_get_float(brVal);
     bool success = false;
+    fprintf(stderr, "[CHANNEL] setBrightness: id='%s' brightness=%.3f\n",
+            displayId, brightness);
 
     if (strcmp(displayId, "backlight") == 0) {
       std::string backlightPath = FindBacklightPath();
@@ -286,9 +739,23 @@ static void brightness_method_call_handler(FlMethodChannel* channel,
         success = SetBacklightBrightness(backlightPath, brightness);
       }
     } else {
-      // Treat as xrandr output name.
-      success = SetXrandrBrightness(displayId, brightness);
+      // Find the matching DRM display from cached list.
+      std::string idStr(displayId);
+      bool found = false;
+      for (const auto& disp : g_drmDisplays) {
+        if (("drm:" + disp.connector) == idStr) {
+          success = SetDisplayBrightness(disp, brightness);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        fprintf(stderr, "[CHANNEL] setBrightness: no match for '%s' in %zu cached displays\n",
+                displayId, g_drmDisplays.size());
+      }
     }
+
+    fprintf(stderr, "[CHANNEL] setBrightness result: %s\n", success ? "SUCCESS" : "FAILED");
 
     g_autoptr(FlValue) result = fl_value_new_bool(success);
     fl_method_call_respond_success(method_call, result, nullptr);

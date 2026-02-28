@@ -1,5 +1,26 @@
 # Project-level configuration.
 cmake_minimum_required(VERSION 3.13)
+
+# When building with clang on Ubuntu/Debian, it may be configured to look for a
+# GCC version whose development headers/libraries are not installed.  Detect the
+# mismatch and point clang at an available GCC toolchain so that both the CMake
+# compiler test and the actual build can find libstdc++ headers and libraries.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR "$ENV{CXX}" MATCHES "clang" OR
+   EXISTS "/usr/bin/clang++")
+  # Find the GCC install dir that has both headers and the libstdc++.so dev link.
+  file(GLOB _gcc_vers "/usr/lib/gcc/x86_64-linux-gnu/*")
+  foreach(_dir ${_gcc_vers})
+    if(IS_DIRECTORY ${_dir} AND EXISTS "${_dir}/libstdc++.so")
+      set(_gcc_install_dir "${_dir}")
+    endif()
+  endforeach()
+  if(_gcc_install_dir)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --gcc-install-dir=${_gcc_install_dir}" CACHE STRING "" FORCE)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L${_gcc_install_dir}" CACHE STRING "" FORCE)
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -L${_gcc_install_dir}" CACHE STRING "" FORCE)
+  endif()
+endif()
+
 project(runner LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change

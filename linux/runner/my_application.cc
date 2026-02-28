@@ -304,23 +304,18 @@ static uint8_t DdcChecksum(uint8_t srcAddr, const uint8_t* data, size_t len) {
 static bool DdcGetBrightness(int busNum, int& outCurrent, int& outMax) {
   std::string devPath = "/dev/i2c-" + std::to_string(busNum);
   int fd = open(devPath.c_str(), O_RDWR);
-  if (fd < 0) {
-    fprintf(stderr, "[DDC] bus %d: open failed (errno %d)\n", busNum, errno);
-    return false;
-  }
+  if (fd < 0) return false;
 
   if (ioctl(fd, I2C_SLAVE, DDC_CI_ADDR) < 0) {
-    fprintf(stderr, "[DDC] bus %d: ioctl I2C_SLAVE failed (errno %d)\n", busNum, errno);
     close(fd);
     return false;
   }
 
+  // DDC/CI "Get VCP Feature" request for brightness.
   uint8_t request[] = {0x51, 0x82, 0x01, VCP_BRIGHTNESS, 0x00};
   request[4] = DdcChecksum(0x6E, request, 4);
 
-  ssize_t wr = write(fd, request, sizeof(request));
-  if (wr != sizeof(request)) {
-    fprintf(stderr, "[DDC] bus %d: write failed (%zd, errno %d)\n", busNum, wr, errno);
+  if (write(fd, request, sizeof(request)) != static_cast<ssize_t>(sizeof(request))) {
     close(fd);
     return false;
   }
@@ -328,23 +323,14 @@ static bool DdcGetBrightness(int busNum, int& outCurrent, int& outMax) {
   // DDC/CI spec says to wait 40-50ms for the monitor to respond.
   usleep(50000);
 
-  // Read response: up to 12 bytes.
   uint8_t response[12] = {};
   ssize_t bytesRead = read(fd, response, sizeof(response));
   close(fd);
 
-  fprintf(stderr, "[DDC] bus %d: read %zd bytes:", busNum, bytesRead);
-  for (ssize_t i = 0; i < bytesRead; ++i)
-    fprintf(stderr, " %02x", response[i]);
-  fprintf(stderr, "\n");
-
-  if (bytesRead < 9) {
-    fprintf(stderr, "[DDC] bus %d: response too short\n", busNum);
-    return false;
-  }
+  if (bytesRead < 9) return false;
 
   // Find the VCP Feature Reply opcode (0x02) in the response.
-  // Response format after opcode: [result][vcp_code][type][max_hi][max_lo][cur_hi][cur_lo]
+  // Format: [opcode=0x02][result][vcp_code][type][max_hi][max_lo][cur_hi][cur_lo]
   int offset = -1;
   for (int i = 0; i < bytesRead - 8; ++i) {
     if (response[i] == 0x02 && response[i + 2] == VCP_BRIGHTNESS) {
@@ -352,22 +338,13 @@ static bool DdcGetBrightness(int busNum, int& outCurrent, int& outMax) {
       break;
     }
   }
-  if (offset < 0) {
-    fprintf(stderr, "[DDC] bus %d: no VCP reply found in response\n", busNum);
-    return false;
-  }
+  if (offset < 0) return false;
 
-  // Check result code (0 = no error).
-  if (response[offset + 1] != 0x00) {
-    fprintf(stderr, "[DDC] bus %d: VCP result error %d\n", busNum, response[offset + 1]);
-    return false;
-  }
+  if (response[offset + 1] != 0x00) return false;  // Result code error.
 
-  // offset+3 = VCP type code (skip it)
+  // offset+3 = VCP type code (skip it).
   outMax = (response[offset + 4] << 8) | response[offset + 5];
   outCurrent = (response[offset + 6] << 8) | response[offset + 7];
-
-  fprintf(stderr, "[DDC] bus %d: brightness %d/%d\n", busNum, outCurrent, outMax);
 
   if (outMax <= 0) return false;
   return true;

@@ -11,10 +11,8 @@
 #include <string>
 #include <vector>
 #include <fstream>
-#include <sstream>
 #include <filesystem>
 #include <algorithm>
-#include <map>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
@@ -25,18 +23,6 @@
 #include <linux/i2c.h>
 
 #include "flutter/generated_plugin_registrant.h"
-
-// ── Display info structure ─────────────────────────────────────────
-
-struct DisplayInfo {
-  std::string id;          // Unique ID (e.g., "backlight", "drm:card1-DP-1")
-  std::string name;        // Human-readable name from EDID
-  double brightness;       // 0.0 – 1.0
-  bool isBuiltIn;
-  int i2cBus;              // I2C bus number for DDC/CI, -1 if N/A
-  std::string drmConnector; // DRM connector name (e.g., "card1-DP-1")
-  std::string xrandrName;  // xrandr output name (e.g., "DP-1")
-};
 
 // ── Utility: run a command and capture stdout ──────────────────────
 
@@ -354,13 +340,9 @@ static bool DdcGetBrightness(int busNum, int& outCurrent, int& outMax) {
 static bool DdcSetBrightness(int busNum, int value) {
   std::string devPath = "/dev/i2c-" + std::to_string(busNum);
   int fd = open(devPath.c_str(), O_RDWR);
-  if (fd < 0) {
-    fprintf(stderr, "[DDC SET] bus %d: open failed (errno %d)\n", busNum, errno);
-    return false;
-  }
+  if (fd < 0) return false;
 
   if (ioctl(fd, I2C_SLAVE, DDC_CI_ADDR) < 0) {
-    fprintf(stderr, "[DDC SET] bus %d: ioctl failed (errno %d)\n", busNum, errno);
     close(fd);
     return false;
   }
@@ -370,16 +352,9 @@ static bool DdcSetBrightness(int busNum, int value) {
   uint8_t cmd[] = {0x51, 0x84, 0x03, VCP_BRIGHTNESS, valueHi, valueLo, 0x00};
   cmd[6] = DdcChecksum(0x6E, cmd, 6);
 
-  fprintf(stderr, "[DDC SET] bus %d: setting brightness to %d, cmd:", busNum, value);
-  for (size_t i = 0; i < sizeof(cmd); ++i)
-    fprintf(stderr, " %02x", cmd[i]);
-  fprintf(stderr, "\n");
-
   ssize_t written = write(fd, cmd, sizeof(cmd));
   close(fd);
 
-  fprintf(stderr, "[DDC SET] bus %d: wrote %zd bytes (expected %zu)\n",
-          busNum, written, sizeof(cmd));
   return written == static_cast<ssize_t>(sizeof(cmd));
 }
 
@@ -528,9 +503,6 @@ static std::vector<DrmDisplay> EnumerateDrmDisplays() {
     }
 
     displays.push_back(disp);
-    fprintf(stderr, "[ENUM] %s (%s) i2c=%d ddc=%d edid='%s'\n",
-            disp.connector.c_str(), disp.xrandrName.c_str(),
-            disp.i2cBus, disp.i2cBusDdc, disp.edidName.c_str());
   }
 
   return displays;
@@ -545,8 +517,6 @@ static double GetDisplayBrightness(const DrmDisplay& disp) {
   if (disp.i2cBus >= 0) buses.push_back(disp.i2cBus);
   if (disp.i2cBusDdc >= 0 && disp.i2cBusDdc != disp.i2cBus)
     buses.push_back(disp.i2cBusDdc);
-
-  fprintf(stderr, "[GET] %s: %zu candidate buses\n", disp.connector.c_str(), buses.size());
 
   if (!buses.empty()) {
     // Ensure I2C permissions are set up (one-time, prompts user if needed).
@@ -594,8 +564,6 @@ static double GetDisplayBrightness(const DrmDisplay& disp) {
 
 static bool SetDisplayBrightness(const DrmDisplay& disp, double brightness) {
   int value = static_cast<int>(std::clamp(brightness, 0.0, 1.0) * 100);
-  fprintf(stderr, "[SET] %s: brightness=%.2f -> value=%d\n",
-          disp.connector.c_str(), brightness, value);
 
   // Collect candidate I2C buses to try.
   std::vector<int> buses;
@@ -707,8 +675,6 @@ static void brightness_method_call_handler(FlMethodChannel* channel,
     const char* displayId = fl_value_get_string(idVal);
     double brightness = fl_value_get_float(brVal);
     bool success = false;
-    fprintf(stderr, "[CHANNEL] setBrightness: id='%s' brightness=%.3f\n",
-            displayId, brightness);
 
     if (strcmp(displayId, "backlight") == 0) {
       std::string backlightPath = FindBacklightPath();
@@ -727,12 +693,9 @@ static void brightness_method_call_handler(FlMethodChannel* channel,
         }
       }
       if (!found) {
-        fprintf(stderr, "[CHANNEL] setBrightness: no match for '%s' in %zu cached displays\n",
-                displayId, g_drmDisplays.size());
+        // Display not found in cached list — likely stale data.
       }
     }
-
-    fprintf(stderr, "[CHANNEL] setBrightness result: %s\n", success ? "SUCCESS" : "FAILED");
 
     g_autoptr(FlValue) result = fl_value_new_bool(success);
     fl_method_call_respond_success(method_call, result, nullptr);

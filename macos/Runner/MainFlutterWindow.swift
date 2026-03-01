@@ -88,6 +88,17 @@ final class BrightnessMethodHandler {
       }
       let success = setBrightness(displayId: displayId, brightness: Float(brightness))
       result(success)
+    case "setSoftwareBrightness":
+      guard let args = call.arguments as? [String: Any],
+            let displayId = args["displayId"] as? String,
+            let gamma = args["gamma"] as? Double else {
+        result(FlutterError(code: "INVALID_ARGS",
+                            message: "Missing displayId or gamma",
+                            details: nil))
+        return
+      }
+      let success = setSoftwareBrightness(displayId: displayId, gamma: gamma)
+      result(success)
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -278,6 +289,28 @@ final class BrightnessMethodHandler {
       }
     }
     return false
+  }
+
+  // MARK: - Software Brightness (Gamma)
+
+  /// Sets software brightness by adjusting the display's gamma transfer formula.
+  ///
+  /// Uses CGSetDisplayTransferByFormula to scale RGB output.
+  /// gamma 1.0 = normal, 0.0 = fully black.
+  private func setSoftwareBrightness(displayId: String, gamma: Double) -> Bool {
+    guard let displayIDValue = UInt32(displayId) else { return false }
+    let clamped = min(max(gamma, 0.0), 1.0)
+
+    // CGSetDisplayTransferByFormula: value = min + (max - min) * pow(input, gamma)
+    // To uniformly scale brightness: min=0, gamma=1.0, max=clamped
+    let result = CGSetDisplayTransferByFormula(
+      displayIDValue,
+      0.0, Float(clamped), 1.0,   // Red:   min=0, max=factor, gamma=1
+      0.0, Float(clamped), 1.0,   // Green: min=0, max=factor, gamma=1
+      0.0, Float(clamped), 1.0    // Blue:  min=0, max=factor, gamma=1
+    )
+
+    return result == CGError.success
   }
 
   // MARK: - Display Name

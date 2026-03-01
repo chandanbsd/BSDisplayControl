@@ -610,6 +610,262 @@ static bool SetDisplayBrightness(const DrmDisplay& disp, double brightness) {
 
 static std::vector<DrmDisplay> g_drmDisplays;
 
+// ── Software brightness (gamma) via Mutter D-Bus or xrandr ─────────
+//
+// On GNOME/Wayland: use org.gnome.Mutter.DisplayConfig SetCrtcGamma
+// via GDBus.  This is the only way to set per-output gamma on Wayland
+// since xrandr --brightness only affects the XWayland virtual display.
+//
+// On X11: fall back to xrandr --output NAME --brightness FACTOR.
+//
+// The Mutter D-Bus API:
+//   GetResources() -> (serial, crtcs[], outputs[], modes[], ...)
+//   GetCrtcGamma(serial, crtc_id) -> (aq red, aq green, aq blue)
+//   SetCrtcGamma(serial, crtc_id, aq red, aq green, aq blue)
+
+struct MutterOutputInfo {
+  std::string name;   // e.g., "DP-1", "HDMI-1"
+  int crtcId;         // Mutter CRTC index (not DRM winsys ID)
+  int gammaSize;      // LUT entries (typically 4096)
+};
+
+static uint32_t g_mutterSerial = 0;
+static std::vector<MutterOutputInfo> g_mutterOutputs;
+static bool g_mutterQueried = false;
+static bool g_isWayland = false;
+
+// Detect if we're running on native Wayland.
+static bool IsWayland() {
+  static bool checked = false;
+  static bool result = false;
+  if (!checked) {
+    checked = true;
+    const char* wl = getenv("WAYLAND_DISPLAY");
+    const char* st = getenv("XDG_SESSION_TYPE");
+    result = (wl && wl[0] != '\0') || (st && strcmp(st, "wayland") == 0);
+  }
+  return result;
+}
+
+// Query Mutter's DisplayConfig.GetResources to build output -> CRTC mapping.
+// Also fetches gamma LUT size for each active CRTC.
+static bool QueryMutterResources() {
+  if (g_mutterQueried) return !g_mutterOutputs.empty();
+  g_mutterQueried = true;
+  g_mutterOutputs.clear();
+
+  g_autoptr(GError) error = nullptr;
+  g_autoptr(GDBusConnection) bus = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &error);
+  if (!bus) {
+    fprintf(stderr, "[BSDisplayControl] D-Bus session bus unavailable: %s\n",
+            error ? error->message : "unknown");
+    return false;
+  }
+
+  // Call GetResources: returns (u serial, a(uxiiiiiuaua{sv}) crtcs,
+  //   a(uxiausauaua{sv}) outputs, a(uxuudu) modes, i max_w, i max_h)
+  g_autoptr(GVariant) res = g_dbus_connection_call_sync(
+      bus, "org.gnome.Shell",
+      "/org/gnome/Mutter/DisplayConfig",
+      "org.gnome.Mutter.DisplayConfig",
+      "GetResources", nullptr, nullptr,
+      G_DBUS_CALL_FLAGS_NONE, 5000, nullptr, &error);
+
+  if (!res) {
+    fprintf(stderr, "[BSDisplayControl] Mutter GetResources failed: %s\n",
+            error ? error->message : "unknown");
+    return false;
+  }
+
+  // Extract serial (first element).
+  g_autoptr(GVariant) vSerial = g_variant_get_child_value(res, 0);
+  g_mutterSerial = g_variant_get_uint32(vSerial);
+
+  // Extract outputs array (third element, index 2).
+  // Each output: (u id, x winsys_id, i crtc_id, au possible_crtcs,
+  //               s name, au modes, au clones, a{sv} properties)
+  g_autoptr(GVariant) vOutputs = g_variant_get_child_value(res, 2);
+  gsize numOutputs = g_variant_n_children(vOutputs);
+
+  for (gsize i = 0; i < numOutputs; i++) {
+    g_autoptr(GVariant) vOut = g_variant_get_child_value(vOutputs, i);
+
+    // crtc_id is at index 2 (int32).
+    g_autoptr(GVariant) vCrtcId = g_variant_get_child_value(vOut, 2);
+    gint32 crtcId = g_variant_get_int32(vCrtcId);
+
+    // name is at index 4 (string).
+    g_autoptr(GVariant) vName = g_variant_get_child_value(vOut, 4);
+    const gchar* name = g_variant_get_string(vName, nullptr);
+
+    if (crtcId < 0) continue;  // Output not active.
+
+    MutterOutputInfo info;
+    info.name = name;
+    info.crtcId = crtcId;
+    info.gammaSize = 0;
+
+    // Query gamma LUT size for this CRTC.
+    g_autoptr(GError) gammaError = nullptr;
+    g_autoptr(GVariant) gammaRes = g_dbus_connection_call_sync(
+        bus, "org.gnome.Shell",
+        "/org/gnome/Mutter/DisplayConfig",
+        "org.gnome.Mutter.DisplayConfig",
+        "GetCrtcGamma",
+        g_variant_new("(uu)", g_mutterSerial, (guint32)crtcId),
+        nullptr, G_DBUS_CALL_FLAGS_NONE, 5000, nullptr, &gammaError);
+
+    if (gammaRes) {
+      // Result: (aq red, aq green, aq blue)
+      g_autoptr(GVariant) vRed = g_variant_get_child_value(gammaRes, 0);
+      info.gammaSize = static_cast<int>(g_variant_n_children(vRed));
+    }
+
+    g_mutterOutputs.push_back(info);
+  }
+
+  fprintf(stderr, "[BSDisplayControl] Mutter: serial=%u, %zu outputs mapped\n",
+          g_mutterSerial, g_mutterOutputs.size());
+  for (const auto& o : g_mutterOutputs) {
+    fprintf(stderr, "[BSDisplayControl]   %s -> CRTC %d, gamma %d\n",
+            o.name.c_str(), o.crtcId, o.gammaSize);
+  }
+
+  return !g_mutterOutputs.empty();
+}
+
+// Set gamma via Mutter D-Bus SetCrtcGamma.
+// factor: 0.0 = black, 1.0 = normal (linear ramp).
+static bool SetSoftwareBrightnessWayland(const MutterOutputInfo& output, double factor) {
+  double clamped = std::clamp(factor, 0.0, 1.0);
+  int size = output.gammaSize;
+  if (size <= 0) return false;
+
+  g_autoptr(GError) error = nullptr;
+  g_autoptr(GDBusConnection) bus = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &error);
+  if (!bus) return false;
+
+  // Build gamma LUT: linear ramp scaled by factor.
+  // Each entry: value = (i / (size-1)) * 65535 * factor, as uint16.
+  GVariantBuilder redBuilder, greenBuilder, blueBuilder;
+  g_variant_builder_init(&redBuilder, G_VARIANT_TYPE("aq"));
+  g_variant_builder_init(&greenBuilder, G_VARIANT_TYPE("aq"));
+  g_variant_builder_init(&blueBuilder, G_VARIANT_TYPE("aq"));
+
+  double denom = (size > 1) ? static_cast<double>(size - 1) : 1.0;
+  for (int i = 0; i < size; i++) {
+    guint16 val = static_cast<guint16>(
+        std::clamp(static_cast<double>(i) / denom * 65535.0 * clamped, 0.0, 65535.0));
+    g_variant_builder_add(&redBuilder, "q", val);
+    g_variant_builder_add(&greenBuilder, "q", val);
+    g_variant_builder_add(&blueBuilder, "q", val);
+  }
+
+  g_autoptr(GVariant) result = g_dbus_connection_call_sync(
+      bus, "org.gnome.Shell",
+      "/org/gnome/Mutter/DisplayConfig",
+      "org.gnome.Mutter.DisplayConfig",
+      "SetCrtcGamma",
+      g_variant_new("(uu@aq@aq@aq)",
+                     g_mutterSerial,
+                     static_cast<guint32>(output.crtcId),
+                     g_variant_builder_end(&redBuilder),
+                     g_variant_builder_end(&greenBuilder),
+                     g_variant_builder_end(&blueBuilder)),
+      nullptr, G_DBUS_CALL_FLAGS_NONE, 5000, nullptr, &error);
+
+  if (!result) {
+    fprintf(stderr, "[BSDisplayControl] SetCrtcGamma failed for %s: %s\n",
+            output.name.c_str(), error ? error->message : "unknown");
+    return false;
+  }
+  return true;
+}
+
+// Set gamma via xrandr (X11 fallback).
+static bool SetSoftwareBrightnessX11(const std::string& outputName, double factor) {
+  double clamped = std::clamp(factor, 0.0, 1.0);
+  char gammaStr[32];
+  snprintf(gammaStr, sizeof(gammaStr), "%.4f", clamped);
+
+  pid_t pid = fork();
+  if (pid < 0) return false;
+  if (pid == 0) {
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      dup2(devnull, STDOUT_FILENO);
+      dup2(devnull, STDERR_FILENO);
+      close(devnull);
+    }
+    execlp("xrandr", "xrandr", "--output", outputName.c_str(),
+           "--brightness", gammaStr, nullptr);
+    _exit(1);
+  }
+
+  int status = 0;
+  waitpid(pid, &status, 0);
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+// Find the output name for a given display ID (used for both Wayland and X11).
+static std::string FindOutputName(const char* displayId) {
+  std::string idStr(displayId);
+
+  if (idStr == "backlight") {
+    for (const auto& disp : g_drmDisplays) {
+      if (disp.isBuiltIn) return disp.xrandrName;
+    }
+    for (const auto& name : {"eDP-1", "eDP-2", "LVDS-1"}) {
+      return std::string(name);
+    }
+    return "";
+  }
+
+  // DRM display: extract xrandr/output name from cached DrmDisplay.
+  for (const auto& disp : g_drmDisplays) {
+    if (("drm:" + disp.connector) == idStr) {
+      return disp.xrandrName;
+    }
+  }
+  return "";
+}
+
+// Set software brightness for a display.
+// Dispatches to Wayland (Mutter D-Bus) or X11 (xrandr) based on session type.
+static bool SetSoftwareBrightness(const char* displayId, double gamma) {
+  std::string outputName = FindOutputName(displayId);
+  if (outputName.empty()) return false;
+
+  g_isWayland = IsWayland();
+
+  if (g_isWayland) {
+    // Wayland: use Mutter D-Bus.
+    if (!g_mutterQueried) QueryMutterResources();
+
+    for (const auto& out : g_mutterOutputs) {
+      if (out.name == outputName) {
+        return SetSoftwareBrightnessWayland(out, gamma);
+      }
+    }
+
+    // Output not found — re-query in case monitors changed.
+    g_mutterQueried = false;
+    QueryMutterResources();
+    for (const auto& out : g_mutterOutputs) {
+      if (out.name == outputName) {
+        return SetSoftwareBrightnessWayland(out, gamma);
+      }
+    }
+
+    fprintf(stderr, "[BSDisplayControl] Mutter output '%s' not found\n",
+            outputName.c_str());
+    return false;
+  }
+
+  // X11: use xrandr.
+  return SetSoftwareBrightnessX11(outputName, gamma);
+}
+
 // ── Method channel handler ─────────────────────────────────────────
 
 static void brightness_method_call_handler(FlMethodChannel* channel,
@@ -696,6 +952,29 @@ static void brightness_method_call_handler(FlMethodChannel* channel,
         // Display not found in cached list — likely stale data.
       }
     }
+
+    g_autoptr(FlValue) result = fl_value_new_bool(success);
+    fl_method_call_respond_success(method_call, result, nullptr);
+
+  } else if (strcmp(method, "setSoftwareBrightness") == 0) {
+    FlValue* args = fl_method_call_get_args(method_call);
+    if (fl_value_get_type(args) != FL_VALUE_TYPE_MAP) {
+      fl_method_call_respond_error(method_call, "INVALID_ARGS", "Expected map", nullptr, nullptr);
+      return;
+    }
+
+    FlValue* idVal = fl_value_lookup_string(args, "displayId");
+    FlValue* gammaVal = fl_value_lookup_string(args, "gamma");
+    if (!idVal || !gammaVal) {
+      fl_method_call_respond_error(method_call, "INVALID_ARGS",
+                                   "Missing displayId or gamma", nullptr, nullptr);
+      return;
+    }
+
+    const char* displayId = fl_value_get_string(idVal);
+    double gamma = fl_value_get_float(gammaVal);
+
+    bool success = SetSoftwareBrightness(displayId, gamma);
 
     g_autoptr(FlValue) result = fl_value_new_bool(success);
     fl_method_call_respond_success(method_call, result, nullptr);

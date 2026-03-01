@@ -56,25 +56,59 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Handles the unified slider value (-0.5 to 1.0).
+  ///
+  /// - [0.0, 1.0]: hardware brightness = value, software gamma = 1.0
+  /// - [-0.5, 0.0): hardware brightness = 0, software gamma = 1.0 + 2*value
   void _onBrightnessChanged(DisplayInfo display, double value) {
+    // Decompose unified slider value into hardware + software components.
+    final double hardwareBrightness;
+    final double softwareGamma;
+
+    if (value >= 0.0) {
+      hardwareBrightness = value;
+      softwareGamma = 1.0;
+    } else {
+      hardwareBrightness = 0.0;
+      // Map -0.5 → 0.0, 0.0 → 1.0
+      softwareGamma = 1.0 + (value * 2.0);
+    }
+
     // Update UI immediately for responsiveness.
     setState(() {
       _displays = _displays.map((d) {
         if (d.id == display.id) {
-          return d.copyWith(brightness: value);
+          return d.copyWith(
+            brightness: hardwareBrightness,
+            softwareBrightness: softwareGamma,
+          );
         }
         return d;
       }).toList();
     });
 
-    // Debounce the actual platform call to avoid flooding.
+    // Debounce the actual platform calls to avoid flooding.
     _debounceTimer?.cancel();
     _debounceTimer = Timer(const Duration(milliseconds: 16), () async {
       try {
+        // Always set hardware brightness.
         await _brightnessService.setBrightness(
           displayId: display.id,
-          brightness: value,
+          brightness: hardwareBrightness,
         );
+        // Set software gamma (1.0 = normal, <1.0 = dimmed).
+        if (softwareGamma < 1.0) {
+          await _brightnessService.setSoftwareBrightness(
+            displayId: display.id,
+            gamma: softwareGamma,
+          );
+        } else {
+          // Reset gamma to normal when not in software dimming range.
+          await _brightnessService.setSoftwareBrightness(
+            displayId: display.id,
+            gamma: 1.0,
+          );
+        }
       } catch (e) {
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(

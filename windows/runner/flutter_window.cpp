@@ -246,6 +246,63 @@ cleanup:
   return result;
 }
 
+// ── Software brightness via gamma ramp ─────────────────────────────
+//
+// SetDeviceGammaRamp scales the display's color lookup table.
+// A gamma factor of 1.0 = normal, 0.0 = fully black.
+
+static bool SetSoftwareBrightnessById(const std::string& displayId, double gamma) {
+  int targetIndex;
+  try {
+    targetIndex = std::stoi(displayId);
+  } catch (const std::exception&) {
+    return false;
+  }
+
+  double clamped = std::clamp(gamma, 0.0, 1.0);
+
+  struct GammaCtx {
+    int targetIndex;
+    int currentIndex;
+    double gamma;
+    bool success;
+  };
+
+  GammaCtx gammaCtx{targetIndex, 0, clamped, false};
+
+  EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR hMonitor, HDC, LPRECT, LPARAM dwData) -> BOOL {
+    auto* ctx = reinterpret_cast<GammaCtx*>(dwData);
+
+    if (ctx->currentIndex == ctx->targetIndex) {
+      // Get the device context for this monitor.
+      MONITORINFOEXW monInfo{};
+      monInfo.cbSize = sizeof(MONITORINFOEXW);
+      GetMonitorInfoW(hMonitor, &monInfo);
+
+      HDC hdc = CreateDCW(monInfo.szDevice, monInfo.szDevice, nullptr, nullptr);
+      if (!hdc) return FALSE;
+
+      // Build a gamma ramp scaled by the gamma factor.
+      WORD gammaRamp[3][256];
+      for (int i = 0; i < 256; ++i) {
+        WORD value = static_cast<WORD>(i * 256 * ctx->gamma);
+        gammaRamp[0][i] = value;  // Red
+        gammaRamp[1][i] = value;  // Green
+        gammaRamp[2][i] = value;  // Blue
+      }
+
+      ctx->success = SetDeviceGammaRamp(hdc, gammaRamp) != 0;
+      DeleteDC(hdc);
+      return FALSE;  // Stop enumerating.
+    }
+
+    ctx->currentIndex++;
+    return TRUE;
+  }, reinterpret_cast<LPARAM>(&gammaCtx));
+
+  return gammaCtx.success;
+}
+
 // ── Set brightness for a specific monitor ──────────────────────────
 
 static bool SetMonitorBrightnessById(const std::string& displayId, double brightness) {
@@ -392,6 +449,33 @@ void FlutterWindow::SetUpBrightnessChannel() {
           }
 
           bool success = SetMonitorBrightnessById(displayId, brightness);
+          result->Success(flutter::EncodableValue(success));
+
+        } else if (call.method_name() == "setSoftwareBrightness") {
+          const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+          if (!args) {
+            result->Error("INVALID_ARGS", "Expected a map of arguments");
+            return;
+          }
+
+          auto idIt = args->find(flutter::EncodableValue("displayId"));
+          auto gammaIt = args->find(flutter::EncodableValue("gamma"));
+          if (idIt == args->end() || gammaIt == args->end()) {
+            result->Error("INVALID_ARGS", "Missing displayId or gamma");
+            return;
+          }
+
+          std::string displayId;
+          double gamma;
+          try {
+            displayId = std::get<std::string>(idIt->second);
+            gamma = std::get<double>(gammaIt->second);
+          } catch (const std::bad_variant_access&) {
+            result->Error("INVALID_ARGS", "displayId must be a string and gamma must be a double");
+            return;
+          }
+
+          bool success = SetSoftwareBrightnessById(displayId, gamma);
           result->Success(flutter::EncodableValue(success));
 
         } else {

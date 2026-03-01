@@ -21,7 +21,7 @@ final class BrightnessService {
         .toList();
   }
 
-  /// Sets the brightness for a specific display.
+  /// Sets the hardware brightness for a specific display.
   ///
   /// [displayId] is the platform-specific display identifier.
   /// [brightness] is clamped to 0.0-1.0.
@@ -33,6 +33,29 @@ final class BrightnessService {
     final result = await _channel.invokeMethod<bool>('setBrightness', {
       'displayId': displayId,
       'brightness': clamped,
+    });
+    return result ?? false;
+  }
+
+  /// Sets the software brightness (gamma) for a specific display.
+  ///
+  /// This applies a gamma ramp adjustment to dim the display below
+  /// the hardware minimum. [gamma] is clamped to 0.0-1.0 where:
+  /// - 1.0 = normal (no software dimming)
+  /// - 0.0 = fully dimmed (black screen)
+  ///
+  /// Uses platform-specific gamma APIs:
+  /// - Linux: xrandr --brightness
+  /// - Windows: SetDeviceGammaRamp
+  /// - macOS: CGSetDisplayTransferByFormula
+  Future<bool> setSoftwareBrightness({
+    required String displayId,
+    required double gamma,
+  }) async {
+    final clamped = gamma.clamp(0.0, 1.0);
+    final result = await _channel.invokeMethod<bool>('setSoftwareBrightness', {
+      'displayId': displayId,
+      'gamma': clamped,
     });
     return result ?? false;
   }

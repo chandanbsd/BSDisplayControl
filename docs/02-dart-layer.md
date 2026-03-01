@@ -125,7 +125,7 @@ final class BrightnessService {
 
 | Property | Value |
 | --- | --- |
-| Channel name | `"com.bsdisplaycontrol/brightness"` |
+| Channel name | `"com.chandanbsd.bsdisplaycontrol/brightness"` |
 | Codec | `StandardMethodCodec` (default, binary serialization) |
 
 ### Methods

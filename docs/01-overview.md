@@ -41,7 +41,7 @@ The app follows Flutter's **Platform Channel** pattern. If you're familiar with 
 +------------------------------------------------------------------+
                         |
                   MethodChannel
-              "com.bsdisplaycontrol/brightness"
+              "com.chandanbsd.bsdisplaycontrol/brightness"
                         |
           +-------------+-------------+
           |             |             |

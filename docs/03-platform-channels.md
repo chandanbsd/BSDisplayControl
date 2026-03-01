@@ -25,7 +25,7 @@ In web development, your Angular frontend calls your ASP.NET Core backend via HT
 
 | Property | Value |
 | --- | --- |
-| Channel name | `"com.bsdisplaycontrol/brightness"` |
+| Channel name | `"com.chandanbsd.bsdisplaycontrol/brightness"` |
 | Codec | `StandardMethodCodec` (binary, not JSON) |
 | Direction | Dart calls native (not bidirectional) |
 
@@ -94,7 +94,7 @@ In `windows/runner/flutter_window.cpp`, the channel is set up in `FlutterWindow:
 void FlutterWindow::SetUpBrightnessChannel() {
   auto channel = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
       flutter_controller_->engine()->messenger(),
-      "com.bsdisplaycontrol/brightness",
+      "com.chandanbsd.bsdisplaycontrol/brightness",
       &flutter::StandardMethodCodec::GetInstance());
 
   channel->SetMethodCallHandler(
@@ -113,7 +113,7 @@ In `macos/Runner/MainFlutterWindow.swift`, the channel is set up in `awakeFromNi
 
 ```swift
 let channel = FlutterMethodChannel(
-  name: "com.bsdisplaycontrol/brightness",
+  name: "com.chandanbsd.bsdisplaycontrol/brightness",
   binaryMessenger: flutterViewController.engine.binaryMessenger
 )
 let brightnessHandler = BrightnessMethodHandler()
@@ -128,7 +128,7 @@ In `linux/runner/my_application.cc`, the channel is set up in `my_application_ac
 g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
 FlMethodChannel* brightness_channel = fl_method_channel_new(
     fl_engine_get_binary_messenger(fl_view_get_engine(view)),
-    "com.bsdisplaycontrol/brightness",
+    "com.chandanbsd.bsdisplaycontrol/brightness",
     FL_METHOD_CODEC(codec));
 fl_method_channel_set_method_call_handler(
     brightness_channel,

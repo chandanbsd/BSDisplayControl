@@ -11,7 +11,7 @@ This document covers how BSDisplayControl reads and writes monitor brightness on
 ```
 MainFlutterWindow.awakeFromNib()
          |
-    FlutterMethodChannel("com.bsdisplaycontrol/brightness")
+    FlutterMethodChannel("com.chandanbsd.bsdisplaycontrol/brightness")
          |
     BrightnessMethodHandler
          |
@@ -197,7 +197,7 @@ Runner.xcworkspace/
 | Setting | Value |
 | --- | --- |
 | `PRODUCT_NAME` | `bs_display_control` |
-| `PRODUCT_BUNDLE_IDENTIFIER` | `com.bsdisplaycontrol.bsDisplayControl` |
+| `PRODUCT_BUNDLE_IDENTIFIER` | `com.chandanbsd.bsdisplaycontrol.bsDisplayControl` |
 | Warnings | `-Wall`, strict nullable, shadow, unreachable code warnings |
 | Minimum deployment target | Set in Xcode project (typically macOS 10.14+) |
 

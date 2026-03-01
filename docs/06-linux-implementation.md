@@ -11,7 +11,7 @@ The Linux implementation is the most complex of the three platforms because Linu
 ```
 my_application_activate()
     |
-    +-- FlMethodChannel("com.bsdisplaycontrol/brightness")
+    +-- FlMethodChannel("com.chandanbsd.bsdisplaycontrol/brightness")
          |
          +-- "getDisplays"
          |    |

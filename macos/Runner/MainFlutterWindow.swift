@@ -13,7 +13,7 @@ class MainFlutterWindow: NSWindow {
 
     // Register the brightness method channel.
     let channel = FlutterMethodChannel(
-      name: "com.bsdisplaycontrol/brightness",
+      name: "com.chandanbsd.bsdisplaycontrol/brightness",
       binaryMessenger: flutterViewController.engine.binaryMessenger
     )
     let brightnessHandler = BrightnessMethodHandler()

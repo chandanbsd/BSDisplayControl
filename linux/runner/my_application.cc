@@ -19,30 +19,43 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <pwd.h>
 #include <linux/i2c-dev.h>
 #include <linux/i2c.h>
 
 #include "flutter/generated_plugin_registrant.h"
 
-// ── Utility: run a command and capture stdout ──────────────────────
-
-static std::string RunCommand(const std::string& cmd) {
-  FILE* pipe = popen(cmd.c_str(), "r");
-  if (!pipe) return "";
-  std::string result;
-  char buf[256];
-  while (fgets(buf, sizeof(buf), pipe)) {
-    result += buf;
-  }
-  pclose(pipe);
-  return result;
-}
-
-// ── Utility: check if a command exists ─────────────────────────────
+// ── Utility: check if a command exists (safe, no shell) ────────────
+// Searches PATH directories for the executable using access().
 
 static bool CommandExists(const std::string& cmd) {
-  std::string check = "which " + cmd + " >/dev/null 2>&1";
-  return system(check.c_str()) == 0;
+  // Reject anything with path separators or shell metacharacters.
+  for (char c : cmd) {
+    if (c == '/' || c == '\\' || c == ';' || c == '&' || c == '|' ||
+        c == '`' || c == '$' || c == '(' || c == ')' || c == '\'' ||
+        c == '"' || c == ' ' || c == '\t' || c == '\n') {
+      return false;
+    }
+  }
+
+  const char* pathEnv = getenv("PATH");
+  if (!pathEnv) return false;
+
+  std::string pathStr(pathEnv);
+  size_t start = 0;
+  while (start < pathStr.size()) {
+    size_t end = pathStr.find(':', start);
+    if (end == std::string::npos) end = pathStr.size();
+    std::string dir = pathStr.substr(start, end - start);
+    if (!dir.empty()) {
+      std::string fullPath = dir + "/" + cmd;
+      if (access(fullPath.c_str(), X_OK) == 0) {
+        return true;
+      }
+    }
+    start = end + 1;
+  }
+  return false;
 }
 
 // ── EDID parsing: extract monitor name from raw EDID ───────────────
@@ -190,13 +203,60 @@ static const uint8_t VCP_BRIGHTNESS = 0x10;
 static bool g_i2c_setup_attempted = false;
 static bool g_i2c_accessible = false;
 
+// Helper: run a command via fork/exec with no shell.  Returns exit status.
+// argv[0] is the program name, last element must be nullptr.
+static int ForkExec(const char* const argv[]) {
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    // Child: silence stdout/stderr.
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      dup2(devnull, STDOUT_FILENO);
+      dup2(devnull, STDERR_FILENO);
+      close(devnull);
+    }
+    execvp(argv[0], const_cast<char* const*>(argv));
+    _exit(127);
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+// Get the current username safely via getpwuid (not getenv).
+static std::string GetCurrentUsername() {
+  struct passwd* pw = getpwuid(getuid());
+  if (pw && pw->pw_name) return std::string(pw->pw_name);
+  return "";
+}
+
+// Validate username: only allow [a-z_][a-z0-9_-]* (POSIX portable).
+static bool IsValidUsername(const std::string& name) {
+  if (name.empty() || name.size() > 32) return false;
+  // First char: lowercase letter or underscore.
+  char c0 = name[0];
+  if (!((c0 >= 'a' && c0 <= 'z') || c0 == '_')) return false;
+  for (size_t i = 1; i < name.size(); i++) {
+    char c = name[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+          c == '_' || c == '-')) return false;
+  }
+  return true;
+}
+
 static bool SetupI2cPermissions() {
   if (g_i2c_setup_attempted) return g_i2c_accessible;
   g_i2c_setup_attempted = true;
 
   // Check if i2c-dev module is loaded; load it if not.
-  if (!std::filesystem::exists("/dev/i2c-0")) {
-    system("modprobe i2c-dev 2>/dev/null");
+  // Check /sys/module/i2c_dev first to avoid unnecessary modprobe.
+  if (!std::filesystem::exists("/dev/i2c-0") &&
+      !std::filesystem::exists("/sys/module/i2c_dev")) {
+    const char* modprobe_argv[] = {"modprobe", "i2c-dev", nullptr};
+    ForkExec(modprobe_argv);
+    // Give kernel a moment to create device nodes.
+    usleep(100000);
   }
 
   // Check if we already have access to any I2C device.
@@ -217,46 +277,38 @@ static bool SetupI2cPermissions() {
   // I2C devices exist but are not accessible.
   fprintf(stderr, "[BSDisplayControl] I2C devices not accessible, requesting permissions...\n");
 
-  std::string user = getenv("USER") ? getenv("USER") : "";
-
-  // Step 1: Immediately grant access with chmod 0666 (simple, reliable pkexec call).
-  int ret = system("pkexec chmod 0666 /dev/i2c-*");
-  if (ret != 0) {
-    fprintf(stderr, "[BSDisplayControl] pkexec chmod failed (ret=%d).\n", ret);
-    fprintf(stderr, "[BSDisplayControl] You can set up manually:\n");
-    fprintf(stderr, "  sudo chmod 0666 /dev/i2c-*\n");
-    fprintf(stderr, "  (For permanent fix: sudo usermod -aG i2c $USER and reboot)\n");
+  std::string user = GetCurrentUsername();
+  if (!IsValidUsername(user)) {
+    fprintf(stderr, "[BSDisplayControl] Cannot determine valid username for I2C setup.\n");
     return false;
   }
 
-  // Step 2: Set up persistent udev rule + i2c group in background (best-effort).
-  // This makes permissions survive reboots. Failures here are non-fatal.
-  if (!user.empty()) {
-    // Write a small script to /tmp and execute it via pkexec.
-    std::string scriptPath = "/tmp/bsdisplaycontrol_i2c_setup.sh";
-    {
-      std::ofstream script(scriptPath);
-      script << "#!/bin/sh\n"
-             << "grep -q '^i2c:' /etc/group || groupadd i2c\n"
-             << "usermod -aG i2c " << user << "\n"
-             << "echo 'KERNEL==\"i2c-[0-9]*\", GROUP=\"i2c\", MODE=\"0666\"' "
-             << "> /etc/udev/rules.d/99-i2c-permissions.rules\n"
-             << "udevadm control --reload-rules 2>/dev/null\n"
-             << "udevadm trigger --subsystem-match=i2c-dev 2>/dev/null\n";
-    }
-    chmod(scriptPath.c_str(), 0755);
+  // Set up persistent udev rule + i2c group via pkexec sh -c "..." (no temp file).
+  // This avoids TOCTOU race conditions with /tmp scripts.
+  // The udev rule grants group 'i2c' read/write on i2c devices with MODE=0660
+  // (not world-readable 0666).
+  std::string setupScript =
+      "grep -q '^i2c:' /etc/group || groupadd i2c; "
+      "usermod -aG i2c " + user + "; "
+      "echo 'KERNEL==\"i2c-[0-9]*\", GROUP=\"i2c\", MODE=\"0660\"' "
+      "> /etc/udev/rules.d/99-i2c-permissions.rules; "
+      "udevadm control --reload-rules 2>/dev/null; "
+      "udevadm trigger --subsystem-match=i2c-dev 2>/dev/null; "
+      "chgrp i2c /dev/i2c-* 2>/dev/null; "
+      "chmod 0660 /dev/i2c-* 2>/dev/null";
 
-    // Run the persistent setup via pkexec (separate prompt, or may be cached).
-    std::string setupCmd = "pkexec " + scriptPath + " 2>/dev/null";
-    int setupRet = system(setupCmd.c_str());
-    if (setupRet != 0) {
-      fprintf(stderr, "[BSDisplayControl] Persistent udev setup failed (non-fatal).\n");
-      fprintf(stderr, "[BSDisplayControl] Permissions will reset on reboot.\n");
-    } else {
-      fprintf(stderr, "[BSDisplayControl] Persistent I2C permissions installed.\n");
-    }
-    unlink(scriptPath.c_str());
+  const char* pkexec_argv[] = {"pkexec", "sh", "-c", setupScript.c_str(), nullptr};
+  int ret = ForkExec(pkexec_argv);
+  if (ret != 0) {
+    fprintf(stderr, "[BSDisplayControl] pkexec I2C setup failed (ret=%d).\n", ret);
+    fprintf(stderr, "[BSDisplayControl] You can set up manually:\n");
+    fprintf(stderr, "  sudo groupadd i2c\n");
+    fprintf(stderr, "  sudo usermod -aG i2c %s\n", user.c_str());
+    fprintf(stderr, "  (Then log out and back in for group to take effect)\n");
+    return false;
   }
+
+  fprintf(stderr, "[BSDisplayControl] Persistent I2C permissions installed.\n");
 
   // Verify access.
   for (const auto& entry : std::filesystem::directory_iterator("/dev")) {
@@ -273,7 +325,8 @@ static bool SetupI2cPermissions() {
     }
   }
 
-  fprintf(stderr, "[BSDisplayControl] I2C still not accessible after setup.\n");
+  // Permissions may not take effect until re-login (group membership).
+  fprintf(stderr, "[BSDisplayControl] I2C not yet accessible — you may need to log out and back in.\n");
   return false;
 }
 
@@ -376,10 +429,39 @@ static bool IsDdcutilAvailable() {
 static bool DdcutilGetBrightness(int busNum, int& outCurrent, int& outMax) {
   if (!IsDdcutilAvailable()) return false;
 
-  char cmd[128];
-  snprintf(cmd, sizeof(cmd),
-           "ddcutil getvcp 10 --bus %d --brief 2>/dev/null", busNum);
-  std::string output = RunCommand(cmd);
+  // Use fork/exec with pipe to capture output (no shell).
+  char busStr[16];
+  snprintf(busStr, sizeof(busStr), "%d", busNum);
+
+  int pipefd[2];
+  if (pipe(pipefd) != 0) return false;
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return false;
+  }
+  if (pid == 0) {
+    close(pipefd[0]);
+    dup2(pipefd[1], STDOUT_FILENO);
+    close(pipefd[1]);
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+    execlp("ddcutil", "ddcutil", "getvcp", "10", "--bus", busStr, "--brief", nullptr);
+    _exit(1);
+  }
+  close(pipefd[1]);
+
+  std::string output;
+  char buf[256];
+  ssize_t n;
+  while ((n = read(pipefd[0], buf, sizeof(buf) - 1)) > 0) {
+    buf[n] = '\0';
+    output += buf;
+  }
+  close(pipefd[0]);
+  waitpid(pid, nullptr, 0);
 
   // Brief format: "VCP 10 C <current> <max>"
   int current = 0, maximum = 0;
@@ -394,10 +476,29 @@ static bool DdcutilGetBrightness(int busNum, int& outCurrent, int& outMax) {
 static bool DdcutilSetBrightness(int busNum, int value) {
   if (!IsDdcutilAvailable()) return false;
 
-  char cmd[128];
-  snprintf(cmd, sizeof(cmd),
-           "ddcutil setvcp 10 %d --bus %d --noverify 2>/dev/null", value, busNum);
-  return system(cmd) == 0;
+  // Use fork/exec instead of system() to avoid shell invocation.
+  char busStr[16], valueStr[16];
+  snprintf(busStr, sizeof(busStr), "%d", busNum);
+  snprintf(valueStr, sizeof(valueStr), "%d", value);
+
+  pid_t pid = fork();
+  if (pid < 0) return false;
+  if (pid == 0) {
+    // Child: redirect stdout/stderr to /dev/null.
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      dup2(devnull, STDOUT_FILENO);
+      dup2(devnull, STDERR_FILENO);
+      close(devnull);
+    }
+    execlp("ddcutil", "ddcutil", "setvcp", "10", valueStr,
+           "--bus", busStr, "--noverify", nullptr);
+    _exit(1);
+  }
+
+  int status = 0;
+  waitpid(pid, &status, 0);
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 // ── DRM-based display enumeration ──────────────────────────────────
@@ -538,13 +639,54 @@ static double GetDisplayBrightness(const DrmDisplay& disp) {
   }
 
   // Fallback: try xrandr verbose output for this specific output.
-  char cmd[256];
-  snprintf(cmd, sizeof(cmd), "xrandr --verbose 2>/dev/null | grep -A15 '^%s connected'",
-           disp.xrandrName.c_str());
-  std::string output = RunCommand(cmd);
+  // Sanitize xrandrName to prevent shell injection (only allow [a-zA-Z0-9_-]).
+  std::string safeName = disp.xrandrName;
+  for (char c : safeName) {
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+      return 1.0;  // Invalid output name, skip xrandr fallback.
+    }
+  }
 
-  auto bpos = output.find("Brightness:");
-  if (bpos != std::string::npos) {
+  // Use fork/exec for xrandr, then parse output in parent.
+  int pipefd[2];
+  if (pipe(pipefd) != 0) return 1.0;
+
+  pid_t xrPid = fork();
+  if (xrPid < 0) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return 1.0;
+  }
+  if (xrPid == 0) {
+    close(pipefd[0]);
+    dup2(pipefd[1], STDOUT_FILENO);
+    close(pipefd[1]);
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+    execlp("xrandr", "xrandr", "--verbose", nullptr);
+    _exit(1);
+  }
+  close(pipefd[1]);
+
+  // Read xrandr output from pipe.
+  std::string output;
+  char buf[4096];
+  ssize_t n;
+  while ((n = read(pipefd[0], buf, sizeof(buf) - 1)) > 0) {
+    buf[n] = '\0';
+    output += buf;
+  }
+  close(pipefd[0]);
+  waitpid(xrPid, nullptr, 0);
+
+  // Search for "OUTPUTNAME connected" and extract Brightness value.
+  std::string marker = safeName + " connected";
+  auto mpos = output.find(marker);
+  if (mpos == std::string::npos) return 1.0;
+
+  auto bpos = output.find("Brightness:", mpos);
+  if (bpos != std::string::npos && bpos - mpos < 2000) {
     auto cpos = output.find(':', bpos);
     if (cpos != std::string::npos) {
       std::string val = output.substr(cpos + 1);
@@ -1039,7 +1181,7 @@ static void my_application_activate(GApplication* application) {
   g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
   FlMethodChannel* brightness_channel = fl_method_channel_new(
       fl_engine_get_binary_messenger(fl_view_get_engine(view)),
-      "com.bsdisplaycontrol/brightness",
+      "com.chandanbsd.bsdisplaycontrol/brightness",
       FL_METHOD_CODEC(codec));
   fl_method_channel_set_method_call_handler(brightness_channel,
                                             brightness_method_call_handler,

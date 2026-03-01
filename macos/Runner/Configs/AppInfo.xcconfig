@@ -8,7 +8,7 @@
 PRODUCT_NAME = bs_display_control
 
 // The application's bundle identifier
-PRODUCT_BUNDLE_IDENTIFIER = com.bsdisplaycontrol.bsDisplayControl
+PRODUCT_BUNDLE_IDENTIFIER = com.chandanbsd.bsdisplaycontrol.bsDisplayControl
 
 // The copyright displayed in application information
-PRODUCT_COPYRIGHT = Copyright © 2026 com.bsdisplaycontrol. All rights reserved.
+PRODUCT_COPYRIGHT = Copyright © 2026 com.chandanbsd.bsdisplaycontrol. All rights reserved.

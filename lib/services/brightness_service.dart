@@ -9,7 +9,9 @@ final class BrightnessService {
 
   static final BrightnessService instance = BrightnessService._();
 
-  static const _channel = MethodChannel('com.bsdisplaycontrol/brightness');
+  static const _channel = MethodChannel(
+    'com.chandanbsd.bsdisplaycontrol/brightness',
+  );
 
   /// Retrieves all connected displays with their current brightness levels.
   Future<List<DisplayInfo>> getDisplays() async {

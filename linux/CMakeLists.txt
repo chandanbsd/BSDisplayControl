@@ -28,7 +28,7 @@ project(runner LANGUAGES CXX)
 set(BINARY_NAME "bs_display_control")
 # The unique GTK application identifier for this application. See:
 # https://wiki.gnome.org/HowDoI/ChooseApplicationID
-set(APPLICATION_ID "com.bsdisplaycontrol.bs_display_control")
+set(APPLICATION_ID "com.chandanbsd.bsdisplaycontrol.bs_display_control")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.

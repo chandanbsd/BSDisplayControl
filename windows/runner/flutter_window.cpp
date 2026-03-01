@@ -402,7 +402,7 @@ bool FlutterWindow::OnCreate() {
 void FlutterWindow::SetUpBrightnessChannel() {
   auto channel = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
       flutter_controller_->engine()->messenger(),
-      "com.bsdisplaycontrol/brightness",
+      "com.chandanbsd.bsdisplaycontrol/brightness",
       &flutter::StandardMethodCodec::GetInstance());
 
   channel->SetMethodCallHandler(

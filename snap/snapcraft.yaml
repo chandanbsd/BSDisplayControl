@@ -1,0 +1,28 @@
+name: bsdisplaycontrol
+version: 0.0.3
+summary: BSDisplayControl
+description: Control the brightness of all connected monitors
+
+confinement: classic
+base: core22
+grade: stable
+
+apps:
+  bsdisplaycontrol:
+    command: bs_display_control
+    environment:
+      # Make the snap's bundled ddcutil and xrandr findable by the app process.
+      PATH: $SNAP/usr/bin:$SNAP/bin:$PATH
+      # ddcutil needs libi2c.so.0 which is bundled in the snap.
+      LD_LIBRARY_PATH: $SNAP/usr/lib/x86_64-linux-gnu:$SNAP/usr/lib:$LD_LIBRARY_PATH
+
+parts:
+  bsdisplaycontrol:
+    source: .
+    source-type: git
+    plugin: flutter
+    flutter-target: lib/main.dart
+    stage-packages:
+      - ddcutil
+      - libi2c0
+      - x11-xserver-utils
